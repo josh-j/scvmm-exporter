@@ -1,0 +1,45 @@
+[Unit]
+Description=SCVMM Prometheus exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SCVMM_HOST=vmm01.example.com
+Environment=SCVMM_USER=EXAMPLE\Administrator
+Environment=SCVMM_EXPORTER_PORT=9620
+Environment=SCVMM_INTERVAL=60
+Environment=SCVMM_TIMEOUT=120
+
+# The password is read from a credential file rather than an Environment= line,
+# so it never appears in `systemctl show` or the unit's environment block.
+# Point this at a root-owned 0400 file containing the password and nothing else.
+LoadCredential=scvmm-password:/etc/scvmm-exporter/password
+ExecStart=/bin/sh -c 'SCVMM_PASSWORD="$(cat "$CREDENTIALS_DIRECTORY/scvmm-password")" exec /usr/local/bin/scvmm_exporter.py'
+
+# A rejected credential is not a crash: the exporter stays up serving
+# scvmm_auth_failed 1 deliberately, so restarts here only cover real faults.
+Restart=on-failure
+RestartSec=30s
+
+DynamicUser=true
+MemoryMax=256M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service ~@privileged ~@resources
+
+[Install]
+WantedBy=multi-user.target
