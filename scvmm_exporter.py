@@ -8,6 +8,8 @@ instead of serving it stale, so no VM, host or cluster gauge ever outlives the
 fleet state it described.
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -165,6 +167,11 @@ def healthy(value):
     return 1.0 if text(value).lower() in HEALTHY_STATES else 0.0
 
 
+# Sentinel exit code the runner uses to say "the script file is not there";
+# picked from the 200s to stay clear of PowerShell's own exit codes.
+REMOTE_SCRIPT_MISSING = 213
+
+
 class Scvmm:
     """The WinRM side: one PowerShell query, decoded."""
 
@@ -176,9 +183,50 @@ class Scvmm:
             operation_timeout_sec=timeout,
             read_timeout_sec=timeout + 10,
         )
+        # run_ps ships its script base64-encoded on the winrs command line,
+        # which Windows caps around 8k characters -- PS_QUERY is past that
+        # ("The command line is too long"). So the query lives in a remote
+        # file instead: uploaded once as plain-base64 chunks (no quoting
+        # hazards), decoded remotely, executed by path ever after. The name
+        # carries a content hash so an edited query never runs a stale file.
+        digest = hashlib.sha256(PS_QUERY.encode("utf-8")).hexdigest()[:12]
+        self._remote_script = r"C:\Windows\Temp\scvmm-exporter-%s.ps1" % digest
+
+    def _run_small(self, script):
+        result = self.session.run_ps(script)
+        if result.status_code != 0:
+            error = result.std_err.decode("utf-8", "replace").strip()
+            raise RuntimeError(error[:500] or "powershell exited %d" % result.status_code)
+        return result
+
+    def _upload_script(self):
+        payload = base64.b64encode(PS_QUERY.encode("utf-8")).decode("ascii")
+        b64_path = self._remote_script + ".b64"
+        self._run_small("Set-Content -Path '%s' -Value '' -NoNewline" % b64_path)
+        chunk = 2000
+        for i in range(0, len(payload), chunk):
+            self._run_small(
+                "Add-Content -Path '%s' -Value '%s' -NoNewline"
+                % (b64_path, payload[i:i + chunk])
+            )
+        self._run_small(
+            "[IO.File]::WriteAllText('%s', [Text.Encoding]::UTF8.GetString("
+            "[Convert]::FromBase64String((Get-Content '%s' -Raw))));"
+            "Remove-Item '%s'" % (self._remote_script, b64_path, b64_path)
+        )
 
     def query(self):
-        result = self.session.run_ps(PS_QUERY)
+        # Check-and-run in one round trip; Windows temp cleanup may remove
+        # the file at any time, so absence is an expected, recoverable state.
+        runner = "if (Test-Path '%s') { & '%s' } else { exit %d }" % (
+            self._remote_script,
+            self._remote_script,
+            REMOTE_SCRIPT_MISSING,
+        )
+        result = self.session.run_ps(runner)
+        if result.status_code == REMOTE_SCRIPT_MISSING:
+            self._upload_script()
+            result = self.session.run_ps(runner)
         if result.status_code != 0:
             error = result.std_err.decode("utf-8", "replace").strip()
             raise RuntimeError(error[:500] or "powershell exited %d" % result.status_code)
